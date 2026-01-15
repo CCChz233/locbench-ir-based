@@ -1,0 +1,57 @@
+# 模型文件 - 排除大型模型权重文件
+models/*/model.safetensors
+models/*/pytorch_model.bin
+models/*/model-*-of-*.safetensors
+models/*/onnx/
+models/*/.mdl
+models/*/.msc
+models/*/.mv
+models/*/tokenizer.model
+
+# 缓存和锁文件
+models/*/.cache/
+models/*/.lock/
+models/*/_.*
+models/*/.gitattributes
+models/*/.gitignore
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 生成的索引数据 - 这些是运行时生成的大文件
+new_index_data/
+outputs/
+
+# 其他大文件
+*.bin
+*.onnx
+*.pkl
+*.pt
+
+# 日志和临时文件
+*.log
+*.tmp
+*.swp
+*~
+
+# IDE和编辑器文件
+.vscode/
+.idea/
+*.sublime-*
+
+# OS文件
+.DS_Store
+Thumbs.db
+
+# 数据文件和资源文件 - 大文件
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.gif
+method/RepoCoder/datasets/
+method/RepoCoder/repositories/
+method/RepoCoder/figs/
