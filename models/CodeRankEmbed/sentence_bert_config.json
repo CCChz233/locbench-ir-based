@@ -1,0 +1,8 @@
+{
+  "max_seq_length": 8192,
+  "do_lower_case": false,
+  "model_args": {
+    "add_pooling_layer": false,
+    "safe_serialization": true
+  }
+}
