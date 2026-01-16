@@ -50,6 +50,13 @@ from tqdm import tqdm
 import logging
 
 try:
+    from sentence_transformers import SentenceTransformer
+    HAS_SENTENCE_TRANSFORMERS = True
+except ImportError:
+    HAS_SENTENCE_TRANSFORMERS = False
+    SentenceTransformer = None
+
+try:
     from llama_index.core import SimpleDirectoryReader
     from llama_index.core.node_parser import (
         CodeSplitter,
@@ -2358,6 +2365,7 @@ def embed_blocks(
     batch_size: int,
     device: torch.device,
     ir_context_tokens: int = 256,
+    use_sentence_transformer: bool = False,
 ) -> torch.Tensor:
     ds = BlockDataset(blocks, tokenizer, max_length, ir_context_tokens=ir_context_tokens)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -2394,9 +2402,15 @@ def embed_blocks(
                             ir_samples[j] = int(length)
             input_ids = input_ids.to(device)
             attn_mask = attn_mask.to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attn_mask)
-            token_embeddings = outputs[0]
-            sent_emb = token_embeddings[:, 0]
+            if use_sentence_transformer:
+                outputs = model.forward({"input_ids": input_ids, "attention_mask": attn_mask})
+                if not isinstance(outputs, dict) or "sentence_embedding" not in outputs:
+                    raise RuntimeError("SentenceTransformer output missing 'sentence_embedding'")
+                sent_emb = outputs["sentence_embedding"]
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attn_mask)
+                token_embeddings = outputs[0]
+                sent_emb = token_embeddings[:, 0]
             sent_emb = torch.nn.functional.normalize(sent_emb, p=2, dim=1)
             outs.append(sent_emb.cpu())
     logger = logging.getLogger(__name__)
@@ -2520,6 +2534,17 @@ def instance_id_to_repo_name(instance_id: str) -> str:
     return repo_part.replace('__', '_')
 
 
+def is_sentence_transformer_model(model_name: str) -> bool:
+    if model_name.startswith("sentence-transformers/"):
+        return True
+    if os.path.isdir(model_name):
+        if os.path.exists(os.path.join(model_name, "modules.json")):
+            return True
+        if os.path.exists(os.path.join(model_name, "_config_sentence_transformers.json")):
+            return True
+    return False
+
+
 # ============================================================================
 # 多进程 Worker
 # ============================================================================
@@ -2576,6 +2601,7 @@ def run(rank: int, repo_queue, args, gpu_ids: list, total_repos: int = 0):
     # 加载模型（每个进程加载一次）
     model = None
     tokenizer = None
+    use_sentence_transformer = False
     try:
         print(f'[Process {rank}] Loading model on GPU {actual_gpu_id}...')
         trust_remote_code = getattr(args, 'trust_remote_code', False)
@@ -2583,8 +2609,19 @@ def run(rank: int, repo_queue, args, gpu_ids: list, total_repos: int = 0):
         model_name = args.model_name
         if not os.path.isabs(model_name) and os.path.exists(model_name):
             model_name = os.path.abspath(model_name)
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-        model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote_code).to(device)
+        use_sentence_transformer = is_sentence_transformer_model(model_name)
+        if use_sentence_transformer:
+            if not HAS_SENTENCE_TRANSFORMERS:
+                raise RuntimeError("sentence-transformers is not installed but model looks like a SentenceTransformer")
+            model = SentenceTransformer(model_name, device=str(device))
+            tokenizer = model.tokenizer
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+            model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+            if getattr(model, "hf_device_map", None):
+                print(f'[Process {rank}] Model uses hf_device_map; skipping .to({device}).')
+            else:
+                model = model.to(device)
         model.eval()
         print(f'[Process {rank}] Model loaded on GPU {actual_gpu_id}.')
     except Exception as e:
@@ -2730,6 +2767,7 @@ def run(rank: int, repo_queue, args, gpu_ids: list, total_repos: int = 0):
                 blocks, model, tokenizer, 
                 args.max_length, args.batch_size, device,
                 ir_context_tokens=args.ir_function_context_tokens,
+                use_sentence_transformer=use_sentence_transformer,
             )
             
             # 清理中间变量，释放内存
