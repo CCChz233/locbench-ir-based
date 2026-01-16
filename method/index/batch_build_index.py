@@ -26,6 +26,7 @@ import ast
 import json
 import os
 import os.path as osp
+import random
 import sys
 import time
 import threading
@@ -46,25 +47,57 @@ import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
-from llama_index.core import SimpleDirectoryReader
-from llama_index.core.node_parser import (
-    CodeSplitter,
-    SentenceSplitter,
-    TokenTextSplitter as LlamaIndexTokenTextSplitter,  # 避免与LangChain冲突
-    SemanticSplitterNodeParser,
-)
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-# EpicSplitter 延迟导入（只在epic策略时导入，避免不必要的依赖）
-# from repo_index.index.epic_split import EpicSplitter
-from langchain_text_splitters import (
-    CharacterTextSplitter,
-    RecursiveCharacterTextSplitter,
-    TokenTextSplitter,
-)
 import logging
 
-# 导入build_index.py中的span_ids提取函数
-from method.index.build_index import extract_span_ids_from_graph
+try:
+    from llama_index.core import SimpleDirectoryReader
+    from llama_index.core.node_parser import (
+        CodeSplitter,
+        SentenceSplitter,
+        TokenTextSplitter as LlamaIndexTokenTextSplitter,  # Avoid name clash with LangChain
+        SemanticSplitterNodeParser,
+    )
+    HAS_LLAMA_INDEX = True
+except ImportError:
+    HAS_LLAMA_INDEX = False
+    SimpleDirectoryReader = None
+    CodeSplitter = None
+    SentenceSplitter = None
+    LlamaIndexTokenTextSplitter = None
+    SemanticSplitterNodeParser = None
+
+try:
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+    HAS_LLAMA_INDEX_HF = True
+except ImportError:
+    HAS_LLAMA_INDEX_HF = False
+    HuggingFaceEmbedding = None
+
+# EpicSplitter 延迟导入（只在epic策略时导入，避免不必要的依赖）
+# from repo_index.index.epic_split import EpicSplitter
+try:
+    from langchain_text_splitters import (
+        CharacterTextSplitter,
+        RecursiveCharacterTextSplitter,
+        TokenTextSplitter,
+    )
+    HAS_LANGCHAIN = True
+except ImportError:
+    HAS_LANGCHAIN = False
+    CharacterTextSplitter = None
+    RecursiveCharacterTextSplitter = None
+    TokenTextSplitter = None
+
+# 导入build_index.py中的span_ids提取函数（可选）
+try:
+    from method.index.build_index import extract_span_ids_from_graph
+    HAS_GRAPH_INDEX = True
+except Exception as e:
+    HAS_GRAPH_INDEX = False
+    _GRAPH_INDEX_IMPORT_ERROR = e
+
+    def extract_span_ids_from_graph(*_args, **_kwargs):
+        return {}
 
 # 尝试导入 datasets，如果失败则只支持本地模式
 try:
@@ -80,12 +113,23 @@ except ImportError:
 
 
 class Block:
-    def __init__(self, file_path: str, start: int, end: int, content: str, block_type: str):
+    def __init__(
+        self,
+        file_path: str,
+        start: int,
+        end: int,
+        content: str,
+        block_type: str,
+        context_text: Optional[str] = None,
+        function_text: Optional[str] = None,
+    ):
         self.file_path = file_path
         self.start = start
         self.end = end
         self.content = content
         self.block_type = block_type
+        self.context_text = context_text
+        self.function_text = function_text
 
 
 @dataclass
@@ -145,22 +189,26 @@ def blocks_sliding(text: str, rel: str, window_size: int, slice_size: int) -> Li
 
 
 def blocks_rl_fixed(text: str, rel: str, max_lines: int = 5000) -> List[Block]:
-    lines = [line for line in text.split("\n") if line.strip()]
+    lines = text.splitlines()
+    non_empty = [(idx, line) for idx, line in enumerate(lines) if line.strip()]
     blocks: List[Block] = []
-    for i in range(0, min(len(lines), max_lines), 12):
-        start = i
-        end = min(i + 12, len(lines))
-        chunk = lines[start:end]
-        blocks.append(Block(rel, start, end - 1, "\n".join(chunk), "rl_fixed"))
+    for i in range(0, min(len(non_empty), max_lines), 12):
+        chunk = non_empty[i:i + 12]
+        if not chunk:
+            break
+        start = chunk[0][0]
+        end = chunk[-1][0]
+        content = "\n".join(line for _, line in chunk)
+        blocks.append(Block(rel, start, end, content, "rl_fixed"))
     return blocks
 
 
 def blocks_rl_mini(text: str, rel: str, max_lines: int = 5000) -> List[Block]:
     mini_blocks = []
     cur = []
-    for line in text.splitlines():
+    for idx, line in enumerate(text.splitlines()):
         if line.strip():
-            cur.append(line)
+            cur.append((idx, line))
         else:
             if cur:
                 mini_blocks.append(cur)
@@ -188,11 +236,17 @@ def blocks_rl_mini(text: str, rel: str, max_lines: int = 5000) -> List[Block]:
             total += len(block)
         else:
             if current:
-                blocks.append(Block(rel, total - len(current) + 1, total, "\n".join(current), "rl_mini"))
-            current = block
+                start = current[0][0]
+                end = current[-1][0]
+                content = "\n".join(line for _, line in current)
+                blocks.append(Block(rel, start, end, content, "rl_mini"))
+            current = list(block)
             total += len(block)
     if current:
-        blocks.append(Block(rel, total - len(current) + 1, total, "\n".join(current), "rl_mini"))
+        start = current[0][0]
+        end = current[-1][0]
+        content = "\n".join(line for _, line in current)
+        blocks.append(Block(rel, start, end, content, "rl_mini"))
     return blocks
 
 
@@ -303,22 +357,36 @@ def _build_ir_function_representation(
     Returns:
         完整的函数表示，用于 embedding
     """
+    context_text = _build_ir_function_context(
+        file_path=file_path,
+        class_name=class_name,
+        module_level_code=module_level_code,
+        class_attributes=class_attributes,
+    )
+    if context_text.strip():
+        return f"{context_text} {function_code}"
+    return function_code
+
+
+def _build_ir_function_context(
+    file_path: str,
+    class_name: Optional[str],
+    module_level_code: str,
+    class_attributes: str,
+) -> str:
     parts = [file_path]
-    
+
     if class_name:
         parts.append(class_name)
-    
+
     # 添加模块级上下文（冗余复制到每个函数）
     if module_level_code.strip():
         parts.append(module_level_code.strip())
-    
+
     # 添加类属性（如果是类方法）
     if class_attributes.strip():
         parts.append(class_attributes.strip())
-    
-    # 添加函数代码
-    parts.append(function_code)
-    
+
     return " ".join(parts)
 
 
@@ -426,6 +494,12 @@ def blocks_ir_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict
                     qualified_name = f"{rel}::{function_name}"
             
             # 按照论文方式构建 IR 表示
+            context_text = _build_ir_function_context(
+                file_path=rel,
+                class_name=class_name,
+                module_level_code=module_level_code,
+                class_attributes=class_attributes,
+            )
             ir_representation = _build_ir_function_representation(
                 file_path=rel,
                 class_name=class_name,
@@ -435,7 +509,15 @@ def blocks_ir_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict
             )
             
             # 创建 Block
-            block = Block(rel, start_line, end_line, ir_representation, "ir_function")
+            block = Block(
+                rel,
+                start_line,
+                end_line,
+                ir_representation,
+                "ir_function",
+                context_text=context_text,
+                function_text=func_code,
+            )
             block_index = len(blocks)
             blocks.append(block)
             
@@ -642,6 +724,9 @@ def blocks_function_level_with_fallback(
     """
     # 1. 先提取所有函数级块
     function_blocks, function_metadata = blocks_by_function(text, rel)
+    function_metadata_by_block = {
+        function_blocks[idx]: metadata for idx, metadata in function_metadata.items()
+    }
     
     # 非 Python 文件或解析失败时，直接使用 fixed 策略
     if not rel.endswith('.py') or not function_blocks:
@@ -712,8 +797,14 @@ def blocks_function_level_with_fallback(
     
     # 按起始行号排序，保持文件顺序
     all_blocks.sort(key=lambda b: b.start)
-    
-    return all_blocks, function_metadata
+
+    sorted_metadata = {}
+    for idx, block in enumerate(all_blocks):
+        metadata = function_metadata_by_block.get(block)
+        if metadata is not None:
+            sorted_metadata[idx] = metadata
+
+    return all_blocks, sorted_metadata
 
 
 def blocks_by_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict[str, Optional[str]]]]:
@@ -792,6 +883,10 @@ def blocks_by_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict
                 # 获取行号
                 start_line = node.lineno - 1  # 转换为0-based
                 end_line = node.end_lineno - 1 if hasattr(node, 'end_lineno') else start_line + 10
+                if node.decorator_list:
+                    first_decorator = node.decorator_list[0]
+                    if hasattr(first_decorator, 'lineno'):
+                        start_line = min(start_line, first_decorator.lineno - 1)
                 
                 # 获取函数完整代码
                 func_code = get_function_code(node)
@@ -851,6 +946,10 @@ def blocks_by_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict
                 
                 start_line = node.lineno - 1
                 end_line = node.end_lineno - 1 if hasattr(node, 'end_lineno') else start_line + 10
+                if node.decorator_list:
+                    first_decorator = node.decorator_list[0]
+                    if hasattr(first_decorator, 'lineno'):
+                        start_line = min(start_line, first_decorator.lineno - 1)
                 
                 # 使用get_function_code获取完整代码（包括装饰器）
                 func_code = get_function_code(node)
@@ -926,13 +1025,21 @@ def blocks_by_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict
 
 
 def collect_blocks(repo_path: str, strategy: str, block_size: int, window_size: int, slice_size: int) -> List[Block]:
+    logger = logging.getLogger(__name__)
     repo_root = Path(repo_path)
     blocks: List[Block] = []
     for p in iter_files(repo_root):
         try:
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            text = p.read_text(encoding="utf-8", errors="ignore")
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception as e:
+                logger.warning(f"Error reading {p}: {e}")
+                continue
+        except Exception as e:
+            logger.warning(f"Error reading {p}: {e}")
+            continue
         rel = str(p.relative_to(repo_root))
         if strategy == "fixed":
             blocks.extend(blocks_fixed_lines(text, rel, block_size))
@@ -995,15 +1102,18 @@ def collect_epic_blocks(repo_path: str, config: Optional[EpicSplitterConfig] = N
     """
     使用与 BM25 一致的 EpicSplitter 构建块，并做上下文增强。
     """
+    logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use epic strategy.")
+        return []
+
     # 延迟导入 EpicSplitter，避免不必要的依赖
     try:
         from repo_index.index.epic_split import EpicSplitter
     except ImportError as e:
-        logger = logging.getLogger(__name__)
         logger.error(f"Failed to import EpicSplitter: {e}. Please install required dependencies.")
         return []
-    
-    logger = logging.getLogger(__name__)
+
     if config is None:
         config = EpicSplitterConfig.from_bm25_config()
 
@@ -1219,6 +1329,12 @@ def collect_langchain_recursive_blocks(
         代码块列表
     """
     logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use langchain strategies.")
+        return []
+    if not HAS_LANGCHAIN:
+        logger.error("LangChain text splitters are not available; install langchain-text-splitters to use langchain strategies.")
+        return []
     
     # 1. 读取仓库为文档
     try:
@@ -1323,6 +1439,12 @@ def collect_langchain_fixed_blocks(
         代码块列表
     """
     logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use langchain strategies.")
+        return []
+    if not HAS_LANGCHAIN:
+        logger.error("LangChain text splitters are not available; install langchain-text-splitters to use langchain strategies.")
+        return []
     
     # 1. 读取仓库为文档
     try:
@@ -1428,6 +1550,12 @@ def collect_langchain_token_blocks(
         代码块列表
     """
     logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use langchain strategies.")
+        return []
+    if not HAS_LANGCHAIN:
+        logger.error("LangChain text splitters are not available; install langchain-text-splitters to use langchain strategies.")
+        return []
     
     # 1. 读取仓库为文档
     try:
@@ -1537,6 +1665,9 @@ def collect_llamaindex_code_blocks(
         代码块列表
     """
     logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use llamaindex_code strategy.")
+        return []
     
     # 1. 读取仓库为文档（复用现有模式）
     try:
@@ -1611,6 +1742,7 @@ def collect_llamaindex_code_blocks(
     for file_path, file_docs in file_to_docs.items():
         # 合并同一文件的所有文档内容
         file_contents[file_path] = '\n'.join([doc.get_content() for doc in file_docs])
+    previous_chunk_end_by_file = {}
 
     for node in nodes:
         file_path = node.metadata.get('file_path', '') or node.metadata.get('file_name', '')
@@ -1623,9 +1755,15 @@ def collect_llamaindex_code_blocks(
         
         # 获取或计算行号
         original_content = file_contents.get(file_path, content_text)
+        prev_end = previous_chunk_end_by_file.get(file_path, 0)
         start_line, end_line = _get_or_calculate_line_numbers(
-            node, original_content, previous_chunk_end=0
+            node, original_content, previous_chunk_end=prev_end
         )
+        chunk_pos = original_content.find(content_text, prev_end)
+        if chunk_pos >= 0:
+            previous_chunk_end_by_file[file_path] = chunk_pos + len(content_text)
+        else:
+            previous_chunk_end_by_file[file_path] = max(prev_end, end_line * 80)
         
         content = build_context_enhanced_content(
             file_path=file_path,
@@ -1669,6 +1807,9 @@ def collect_llamaindex_sentence_blocks(
         代码块列表
     """
     logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use llamaindex_sentence strategy.")
+        return []
     
     # 1. 读取仓库为文档
     try:
@@ -1717,6 +1858,7 @@ def collect_llamaindex_sentence_blocks(
     for file_path, file_docs in file_to_docs.items():
         # 合并同一文件的所有文档内容
         file_contents[file_path] = '\n'.join([doc.get_content() for doc in file_docs])
+    previous_chunk_end_by_file = {}
 
     for node in nodes:
         file_path = node.metadata.get('file_path', '') or node.metadata.get('file_name', '')
@@ -1729,9 +1871,15 @@ def collect_llamaindex_sentence_blocks(
         
         # 获取或计算行号
         original_content = file_contents.get(file_path, content_text)
+        prev_end = previous_chunk_end_by_file.get(file_path, 0)
         start_line, end_line = _get_or_calculate_line_numbers(
-            node, original_content, previous_chunk_end=0
+            node, original_content, previous_chunk_end=prev_end
         )
+        chunk_pos = original_content.find(content_text, prev_end)
+        if chunk_pos >= 0:
+            previous_chunk_end_by_file[file_path] = chunk_pos + len(content_text)
+        else:
+            previous_chunk_end_by_file[file_path] = max(prev_end, end_line * 80)
         
         content = build_context_enhanced_content(
             file_path=file_path,
@@ -1772,6 +1920,9 @@ def collect_llamaindex_token_blocks(
         代码块列表
     """
     logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use llamaindex_token strategy.")
+        return []
     
     # 1. 读取仓库为文档
     try:
@@ -1821,6 +1972,7 @@ def collect_llamaindex_token_blocks(
     for file_path, file_docs in file_to_docs.items():
         # 合并同一文件的所有文档内容
         file_contents[file_path] = '\n'.join([doc.get_content() for doc in file_docs])
+    previous_chunk_end_by_file = {}
 
     for node in nodes:
         file_path = node.metadata.get('file_path', '') or node.metadata.get('file_name', '')
@@ -1833,9 +1985,15 @@ def collect_llamaindex_token_blocks(
         
         # 获取或计算行号
         original_content = file_contents.get(file_path, content_text)
+        prev_end = previous_chunk_end_by_file.get(file_path, 0)
         start_line, end_line = _get_or_calculate_line_numbers(
-            node, original_content, previous_chunk_end=0
+            node, original_content, previous_chunk_end=prev_end
         )
+        chunk_pos = original_content.find(content_text, prev_end)
+        if chunk_pos >= 0:
+            previous_chunk_end_by_file[file_path] = chunk_pos + len(content_text)
+        else:
+            previous_chunk_end_by_file[file_path] = max(prev_end, end_line * 80)
         
         content = build_context_enhanced_content(
             file_path=file_path,
@@ -1874,6 +2032,12 @@ def collect_llamaindex_semantic_blocks(
         代码块列表
     """
     logger = logging.getLogger(__name__)
+    if not HAS_LLAMA_INDEX:
+        logger.error("LlamaIndex is not available; install llama-index to use llamaindex_semantic strategy.")
+        return []
+    if not HAS_LLAMA_INDEX_HF:
+        logger.error("HuggingFaceEmbedding is not available; install LlamaIndex HuggingFace embeddings to use llamaindex_semantic strategy.")
+        return []
     
     # 1. 读取仓库为文档
     try:
@@ -1928,6 +2092,7 @@ def collect_llamaindex_semantic_blocks(
     for file_path, file_docs in file_to_docs.items():
         # 合并同一文件的所有文档内容
         file_contents[file_path] = '\n'.join([doc.get_content() for doc in file_docs])
+    previous_chunk_end_by_file = {}
 
     for node in nodes:
         file_path = node.metadata.get('file_path', '') or node.metadata.get('file_name', '')
@@ -1940,9 +2105,15 @@ def collect_llamaindex_semantic_blocks(
         
         # 获取或计算行号
         original_content = file_contents.get(file_path, content_text)
+        prev_end = previous_chunk_end_by_file.get(file_path, 0)
         start_line, end_line = _get_or_calculate_line_numbers(
-            node, original_content, previous_chunk_end=0
+            node, original_content, previous_chunk_end=prev_end
         )
+        chunk_pos = original_content.find(content_text, prev_end)
+        if chunk_pos >= 0:
+            previous_chunk_end_by_file[file_path] = chunk_pos + len(content_text)
+        else:
+            previous_chunk_end_by_file[file_path] = max(prev_end, end_line * 80)
         
         content = build_context_enhanced_content(
             file_path=file_path,
@@ -2088,44 +2259,182 @@ def collect_function_blocks(repo_path: str, block_size: int = 15) -> Tuple[List[
 # ============================================================================
 
 class BlockDataset(Dataset):
-    def __init__(self, blocks: List[Block], tokenizer, max_length: int):
+    def __init__(self, blocks: List[Block], tokenizer, max_length: int, ir_context_tokens: int = 256):
         self.blocks = blocks
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.ir_context_tokens = ir_context_tokens
 
     def __len__(self):
         return len(self.blocks)
 
     def __getitem__(self, idx: int):
         b = self.blocks[idx]
+        is_ir_function = b.block_type == "ir_function" and bool(b.function_text or b.context_text)
+        if is_ir_function:
+            input_ids, attention_mask, orig_len, truncated = self._encode_ir_function(b)
+        else:
+            input_ids, attention_mask, orig_len, truncated = self._encode_default(b)
+        return input_ids, attention_mask, orig_len, truncated, is_ir_function
+
+    def _pad_to_max_length(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if input_ids.size(0) < self.max_length:
+            pad_len = self.max_length - input_ids.size(0)
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+            pad_ids = torch.full((pad_len,), pad_id, dtype=input_ids.dtype)
+            pad_mask = torch.zeros((pad_len,), dtype=attention_mask.dtype)
+            input_ids = torch.cat([input_ids, pad_ids], dim=0)
+            attention_mask = torch.cat([attention_mask, pad_mask], dim=0)
+        elif input_ids.size(0) > self.max_length:
+            input_ids = input_ids[:self.max_length]
+            attention_mask = attention_mask[:self.max_length]
+        return input_ids, attention_mask
+
+    def _encode_default(self, b: Block) -> Tuple[torch.Tensor, torch.Tensor, int, bool]:
         text = f"file path: {b.file_path}\nlines: {b.start}-{b.end}\n\n{b.content}"
         enc = self.tokenizer(
             text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
+            truncation=False,
+            padding=False,
             return_tensors="pt",
         )
-        return enc["input_ids"].squeeze(0), enc["attention_mask"].squeeze(0)
+        input_ids = enc["input_ids"].squeeze(0)
+        orig_len = int(input_ids.size(0))
+        truncated = orig_len > self.max_length
+
+        if truncated:
+            input_ids = input_ids[:self.max_length]
+        attention_mask = torch.ones_like(input_ids)
+        input_ids, attention_mask = self._pad_to_max_length(input_ids, attention_mask)
+        return input_ids, attention_mask, orig_len, truncated
+
+    def _encode_ir_function(self, b: Block) -> Tuple[torch.Tensor, torch.Tensor, int, bool]:
+        context_text = b.context_text or ""
+        function_text = b.function_text or b.content
+
+        context_ids = []
+        if context_text:
+            context_ids = self.tokenizer(
+                context_text,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=self.ir_context_tokens,
+            )["input_ids"]
+
+        function_ids = self.tokenizer(
+            function_text,
+            add_special_tokens=False,
+            truncation=False,
+        )["input_ids"]
+
+        special_tokens = self.tokenizer.num_special_tokens_to_add(pair=False)
+        orig_len = len(context_ids) + len(function_ids) + special_tokens
+
+        max_function_len = max(self.max_length - special_tokens, 0)
+        if len(function_ids) > max_function_len:
+            function_ids = function_ids[:max_function_len]
+
+        remaining_context = max(self.max_length - special_tokens - len(function_ids), 0)
+        context_ids = context_ids[:remaining_context]
+
+        input_ids = self.tokenizer.build_inputs_with_special_tokens(context_ids + function_ids)
+        attention_mask = [1] * len(input_ids)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        input_ids, attention_mask = self._pad_to_max_length(input_ids, attention_mask)
+
+        truncated = orig_len > self.max_length
+        return input_ids, attention_mask, orig_len, truncated
 
 
-def embed_blocks(blocks: List[Block], model, tokenizer, max_length: int, batch_size: int, device: torch.device) -> torch.Tensor:
-    ds = BlockDataset(blocks, tokenizer, max_length)
+def embed_blocks(
+    blocks: List[Block],
+    model,
+    tokenizer,
+    max_length: int,
+    batch_size: int,
+    device: torch.device,
+    ir_context_tokens: int = 256,
+) -> torch.Tensor:
+    ds = BlockDataset(blocks, tokenizer, max_length, ir_context_tokens=ir_context_tokens)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     model.eval()
     outs = []
+    total_blocks = 0
+    truncated_blocks = 0
+    ir_blocks = 0
+    ir_truncated = 0
+    ir_sum_len = 0
+    ir_samples = []
+    ir_seen = 0
+    sample_limit = 10000
     with torch.no_grad():
-        for input_ids, attn_mask in loader:
+        for input_ids, attn_mask, orig_len, truncated, is_ir in loader:
+            total_blocks += int(orig_len.numel())
+            truncated_blocks += int(truncated.sum().item())
+            ir_batch = int(is_ir.sum().item())
+            if ir_batch:
+                ir_blocks += ir_batch
+                ir_truncated += int((truncated & is_ir).sum().item())
+                orig_len_list = orig_len.tolist()
+                is_ir_list = is_ir.tolist()
+                for length, flag in zip(orig_len_list, is_ir_list):
+                    if not flag:
+                        continue
+                    ir_sum_len += int(length)
+                    ir_seen += 1
+                    if len(ir_samples) < sample_limit:
+                        ir_samples.append(int(length))
+                    else:
+                        j = random.randint(0, ir_seen - 1)
+                        if j < sample_limit:
+                            ir_samples[j] = int(length)
             input_ids = input_ids.to(device)
             attn_mask = attn_mask.to(device)
             outputs = model(input_ids=input_ids, attention_mask=attn_mask)
             token_embeddings = outputs[0]
-            mask = attn_mask.unsqueeze(-1)
-            summed = (token_embeddings * mask).sum(dim=1)
-            counts = mask.sum(dim=1).clamp(min=1)
-            sent_emb = summed / counts
+            sent_emb = token_embeddings[:, 0]
             sent_emb = torch.nn.functional.normalize(sent_emb, p=2, dim=1)
             outs.append(sent_emb.cpu())
+    logger = logging.getLogger(__name__)
+    if total_blocks:
+        logger.info(
+            "Token truncation (>max_length=%d): %d/%d blocks (%.2f%%)",
+            max_length,
+            truncated_blocks,
+            total_blocks,
+            100 * truncated_blocks / total_blocks,
+        )
+    if ir_blocks:
+        avg_len = ir_sum_len / max(ir_blocks, 1)
+        if ir_samples:
+            ir_samples.sort()
+            p50 = ir_samples[int((len(ir_samples) - 1) * 0.50)]
+            p90 = ir_samples[int((len(ir_samples) - 1) * 0.90)]
+            p95 = ir_samples[int((len(ir_samples) - 1) * 0.95)]
+            p99 = ir_samples[int((len(ir_samples) - 1) * 0.99)]
+            max_len = ir_samples[-1]
+            logger.info(
+                "ir_function token lengths (context<=%d): avg=%.1f, p50=%d, p90=%d, p95=%d, p99=%d, max=%d (sample=%d)",
+                ir_context_tokens,
+                avg_len,
+                p50,
+                p90,
+                p95,
+                p99,
+                max_len,
+                len(ir_samples),
+            )
+        logger.info(
+            "ir_function truncation (>max_length=%d): %d/%d blocks (%.2f%%)",
+            max_length,
+            ir_truncated,
+            ir_blocks,
+            100 * ir_truncated / ir_blocks,
+        )
     return torch.cat(outs, dim=0)
 
 
@@ -2163,7 +2472,7 @@ def save_index(
                         "chunking_config": {
                             "min_chunk_size": cfg.min_chunk_size,
                             "chunk_size": cfg.chunk_size,
-                            "max_chunk_size": cfg.chunk_size,
+                            "max_chunk_size": cfg.max_chunk_size,
                             "hard_token_limit": cfg.hard_token_limit,
                             "max_chunks": cfg.max_chunks,
                         },
@@ -2419,7 +2728,8 @@ def run(rank: int, repo_queue, args, gpu_ids: list, total_repos: int = 0):
             
             embeddings = embed_blocks(
                 blocks, model, tokenizer, 
-                args.max_length, args.batch_size, device
+                args.max_length, args.batch_size, device,
+                ir_context_tokens=args.ir_function_context_tokens,
             )
             
             # 清理中间变量，释放内存
@@ -2428,6 +2738,10 @@ def run(rank: int, repo_queue, args, gpu_ids: list, total_repos: int = 0):
             
             # 如果提供了Graph索引目录，尝试提取span_ids
             span_ids_map = {}
+            if graph_index_dir and not HAS_GRAPH_INDEX:
+                print(f'[Process {rank}] Warning: Graph index support unavailable: {_GRAPH_INDEX_IMPORT_ERROR}')
+                graph_index_dir = None
+
             if graph_index_dir:
                 graph_index_file = osp.join(graph_index_dir, f"{repo_name}.pkl")
                 if osp.exists(graph_index_file):
@@ -2550,12 +2864,18 @@ def main():
                         help="SemanticSplitterNodeParser: 缓冲区大小")
     parser.add_argument("--llamaindex_embed_model", type=str, default="sentence-transformers/all-MiniLM-L6-v2",
                         help="SemanticSplitterNodeParser: HuggingFace embedding 模型名称")
+
+    # ir_function 上下文控制参数
+    parser.add_argument("--ir_function_context_tokens", type=int, default=256,
+                        help="ir_function: 上下文（文件/类/模块级/类属性）token 上限")
     
     # 编码参数
     parser.add_argument("--max_length", type=int, default=768,
                         help="最大 token 长度")
     parser.add_argument("--batch_size", type=int, default=8,
                         help="批量大小")
+    parser.add_argument("--log_level", type=str, default="INFO",
+                        help="日志级别（DEBUG, INFO, WARNING, ERROR）")
     
     # 并行参数
     parser.add_argument("--num_processes", type=int, default=1,
@@ -2572,6 +2892,9 @@ def main():
     )
     
     args = parser.parse_args()
+
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
     
     # 规范化模型路径：如果是相对路径且存在，转换为绝对路径
     # 这确保在多进程环境下（spawn模式）所有子进程使用相同的绝对路径
@@ -2740,4 +3063,3 @@ if __name__ == "__main__":
     # 设置多进程启动方式
     mp.set_start_method('spawn', force=True)
     main()
-

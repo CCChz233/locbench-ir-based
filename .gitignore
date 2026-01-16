@@ -1,3 +1,6 @@
+# Models and tokenizers (ignore all when only committing code)
+models/
+
 # 模型文件 - 排除大型模型权重文件
 models/*/model.safetensors
 models/*/pytorch_model.bin
@@ -22,6 +25,7 @@ __pycache__/
 *.pyd
 
 # 生成的索引数据 - 这些是运行时生成的大文件
+index_data/
 new_index_data/
 outputs/
 
@@ -36,6 +40,10 @@ outputs/
 *.tmp
 *.swp
 *~
+build_log.txt
+
+# Notebook checkpoints
+.ipynb_checkpoints/
 
 # IDE和编辑器文件
 .vscode/
