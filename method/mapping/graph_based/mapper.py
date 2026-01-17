@@ -105,3 +105,20 @@ class GraphBasedMapper(BlockMapper):
         
         return found_modules[:top_k_modules], found_entities[:top_k_entities]
 
+
+    def map_to_line_numbers(self, instance_id: str, file_path: str, relevant_blocks: List[Dict[str, Any]]) -> List[int]:
+        """
+        将文件映射到相关的行号列表
+        
+        Args:
+            instance_id: 实例ID
+            file_path: 文件路径
+            relevant_blocks: 该文件相关的代码块列表
+            
+        Returns:
+            行号列表（1-indexed，从1开始）
+        """
+        # 对于GraphBasedMapper，我们暂时返回空列表
+        # 因为Graph索引主要关注实体而不是具体的行号
+        # TODO: 可以从span_ids信息中推导出更精确的行号
+        return []

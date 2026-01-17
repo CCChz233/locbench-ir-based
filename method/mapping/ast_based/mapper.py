@@ -236,3 +236,30 @@ class ASTBasedMapper(BlockMapper):
         
         return found_modules[:top_k_modules], found_entities[:top_k_entities]
 
+
+    def map_to_line_numbers(self, instance_id: str, file_path: str, relevant_blocks: List[Dict[str, Any]]) -> List[int]:
+        """
+        将文件映射到相关的行号列表
+        
+        Args:
+            instance_id: 实例ID
+            file_path: 文件路径
+            relevant_blocks: 该文件相关的代码块列表
+            
+        Returns:
+            行号列表（1-indexed，从1开始）
+        """
+        line_numbers = set()
+        
+        for block in relevant_blocks:
+            if block.get('file_path') == file_path:
+                start_line = block.get('start_line', 0)
+                end_line = block.get('end_line', 0)
+                
+                # 确保行号有效
+                if start_line >= 0 and end_line >= 0:
+                    # 添加代码块范围内的所有行号（转换为1-indexed）
+                    for line_num in range(start_line + 1, end_line + 2):  # +2 因为range不包含结束值，需要+1
+                        line_numbers.add(line_num)
+        
+        return sorted(list(line_numbers))
